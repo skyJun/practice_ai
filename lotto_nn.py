@@ -15,6 +15,7 @@ learning_rate = 1e-4
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 lotto_numbers = [
+    [5,7,12,20,25,26],
     [30,31,34,39,41,45],
     [10,16,19,27,37,38],
     [4,8,22,26,32,38],
