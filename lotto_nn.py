@@ -10,7 +10,7 @@ from scipy.optimize import linear_sum_assignment
 # 하이퍼파라미터
 window_size = 5
 batch_size = 64
-num_epochs = 100
+num_epochs = 500
 learning_rate = 1e-4
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -577,11 +577,42 @@ lotto_numbers = [
 # 데이터 전처리: 1-based -> 0-based 변환
 lotto_data = [[n-1 for n in draw] for draw in lotto_numbers]
 
-# 데이터셋 클래스
+# ---------------------------
+# 제조 오차(물리 현상) 시뮬레이션
+# 아래에서 불어 올리는 공기의 영향으로, 약간의 제조 차이가 실제 당첨 번호에 미치는 영향을 
+# 단순하게 확률 편향으로 반영합니다.
+# 각 공은 무게와 둘레에서 약간의 오차가 있다고 가정합니다.
+# (실제 값: 기준 4g, ±5% / 둘레 44.5㎜, ±2.5%)
+np.random.seed(42)
+ball_weights = np.random.normal(4.0, 0.1, 45)        # 공마다 무게 (g): 평균 4.0, 표준편차 0.1
+ball_diameters = np.random.normal(44.5, 1.0, 45)       # 공마다 둘레 (mm): 평균 44.5, 표준편차 1.0
+
+# 공기의 강도(상수; 높을수록 아래에서 불어 올리는 힘이 강함)
+airflow_intensity = 1.0
+
+# 단순 모델: 공기 힘은 (airflow_intensity) / (공의 무게 × 공의 둘레)로 가정하고,
+# 모든 공에 대해 계산한 후 정규화하여 확률 편향 벡터로 사용합니다.
+ball_biases = airflow_intensity / (ball_weights * ball_diameters)
+ball_biases = ball_biases / np.sum(ball_biases)  # 정규화 (합=1)
+physical_bias_tensor = torch.FloatTensor(ball_biases).to(device)
+#print("Physical bias per ball (1~45):", ball_biases)
+
+# ---------------------------
+# 데이터셋 클래스 (물리 정보 추가)
+# ---------------------------
 class EnhancedDataset(Dataset):
     def __init__(self, data, window_size=5):
         self.data = data
         self.window_size = window_size
+        self.training = False  # 기본값
+        
+        # 비너스 추첨기 관련 물리적 정보
+        # [가로(cm), 세로(cm), 전체 높이(cm), 전체 무게(kg), 혼합실 지름(cm),
+        #  공 기준 무게(g), 공 기준 둘레(mm)]
+        self.physical_params = np.array([80, 80, 220, 200, 50, 4, 44.5], dtype=np.float32)
+        # 정규화를 위한 scale 값 (예시)
+        self.physical_scale = np.array([100, 100, 250, 250, 100, 5, 50], dtype=np.float32)
+        self.physical_features = self.physical_params / self.physical_scale  # shape (7,)
         
     def __len__(self):
         return len(self.data) - self.window_size
@@ -590,33 +621,36 @@ class EnhancedDataset(Dataset):
         window = self.data[idx:idx+self.window_size]
         next_num = self.data[idx+self.window_size]
         
-        # 특징 엔지니어링 함수
         def create_features(nums):
-            vec = np.zeros(45+7, dtype=np.float32)
-            vec[np.array(nums)] = 1
+            # 기존 피처: 번호 원-핫(45) + 짝수 비율(1) + 구간 분포(5) + 합계 정규화(1) = 52
+            # 여기에 물리정보 7개를 추가하여 총 59차원 벡터로 구성
+            vec = np.zeros(52 + 7, dtype=np.float32)
+            vec[np.array(nums)] = 1  # 번호 원-핫
             actual_nums = [n+1 for n in nums]
             
             # 짝수 비율
-            even_ratio = sum(1 for n in actual_nums if n%2==0)/6
+            even_ratio = sum(1 for n in actual_nums if n % 2 == 0) / 6
             vec[45] = even_ratio
             
-            # 번호 구간 분포
+            # 번호 구간 분포: 1~10, 11~20, 21~30, 31~40, 41~45
             sections = [
-                sum(1 for n in actual_nums if 1<=n<=10)/6,
-                sum(1 for n in actual_nums if 11<=n<=20)/6,
-                sum(1 for n in actual_nums if 21<=n<=30)/6,
-                sum(1 for n in actual_nums if 31<=n<=40)/6,
-                sum(1 for n in actual_nums if n>=41)/6
+                sum(1 for n in actual_nums if 1 <= n <= 10) / 6,
+                sum(1 for n in actual_nums if 11 <= n <= 20) / 6,
+                sum(1 for n in actual_nums if 21 <= n <= 30) / 6,
+                sum(1 for n in actual_nums if 31 <= n <= 40) / 6,
+                sum(1 for n in actual_nums if n >= 41) / 6
             ]
             vec[46:51] = sections
             
-            # 합계 정규화 (새로운 특징 추가)
+            # 합계 정규화 (최대합 300 정도 가정)
             sum_norm = sum(actual_nums) / 300.0
             vec[51] = sum_norm
             
+            # 물리정보 추가 (인덱스 52~58)
+            vec[52:] = self.physical_features
             return vec
         
-        # 데이터 증강 (훈련 시에만 적용)
+        # 훈련 시 데이터 증강 (번호 순서를 섞어서)
         if self.training and np.random.rand() > 0.5:
             augmented_window = []
             for nums in window:
@@ -625,9 +659,7 @@ class EnhancedDataset(Dataset):
                 augmented_window.append(permuted.tolist())
             window = augmented_window
         
-        # 특징 생성
         features = [create_features(nums) for nums in window]
-        
         return (
             torch.FloatTensor(np.array(features)).to(device),
             torch.LongTensor(next_num).to(device)
@@ -637,11 +669,13 @@ class EnhancedDataset(Dataset):
         self.training = mode
 
 # 하이브리드 모델
+# ---------------------------
+# 하이브리드 모델 (CNN + LSTM + Transformer)
+# 입력 차원은 59로 수정됨
+# ---------------------------
 class HybridModel(nn.Module):
-    def __init__(self, input_size=52, hidden_size=128, num_layers=2):
+    def __init__(self, input_size=59, hidden_size=128, num_layers=2):
         super().__init__()
-        
-        # CNN 파트
         self.conv = nn.Sequential(
             nn.Conv1d(input_size, 64, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -650,8 +684,6 @@ class HybridModel(nn.Module):
             nn.ReLU(),
             nn.AdaptiveMaxPool1d(1)
         )
-        
-        # LSTM 파트
         self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
@@ -659,8 +691,6 @@ class HybridModel(nn.Module):
             bidirectional=True,
             batch_first=True
         )
-        
-        # Transformer 파트
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=hidden_size*2,
@@ -669,36 +699,26 @@ class HybridModel(nn.Module):
             ),
             num_layers=2
         )
-        
-        # 출력 레이어
         self.fc = nn.Sequential(
             nn.Linear(256 + 128, 512),
             nn.ReLU(),
-            nn.Linear(512, 45*6)
+            nn.Linear(512, 45 * 6)
         )
         
     def forward(self, x):
         batch_size, window_size, _ = x.shape
-        
-        # CNN 처리
         cnn_out = self.conv(x.permute(0, 2, 1))
         cnn_out = cnn_out.view(batch_size, -1)
-        
-        # LSTM 처리
         lstm_out, _ = self.lstm(x)
-        
-        # Transformer 처리
         trans_out = self.transformer(lstm_out)
-        
-        # 특성 결합
         cnn_expanded = cnn_out.unsqueeze(1).expand(-1, window_size, -1)
         combined = torch.cat([cnn_expanded, trans_out], dim=2)
-        
-        # 출력 생성
         out = self.fc(combined[:, -1, :])
         return out.view(-1, 6, 45)
 
+# ---------------------------
 # 순열 불변 손실 함수
+# ---------------------------
 class PermutationInvariantLoss(nn.Module):
     def __init__(self, base_loss=nn.CrossEntropyLoss(reduction='none')):
         super().__init__()
@@ -707,34 +727,40 @@ class PermutationInvariantLoss(nn.Module):
     def forward(self, outputs, targets):
         batch_size = outputs.size(0)
         total_loss = 0
-        
         for i in range(batch_size):
             cost_matrix = torch.zeros(6, 6, device=device)
             for p in range(6):
                 for t in range(6):
-                    logit = outputs[i,p].unsqueeze(0)
-                    target = targets[i,t].unsqueeze(0)
-                    cost_matrix[p,t] = self.base_loss(logit, target).mean()
-                    
+                    logit = outputs[i, p].unsqueeze(0)
+                    target = targets[i, t].unsqueeze(0)
+                    cost_matrix[p, t] = self.base_loss(logit, target).mean()
             row_ind, col_ind = linear_sum_assignment(cost_matrix.cpu().detach().numpy())
             total_loss += cost_matrix[row_ind, col_ind].sum()
-            
         return total_loss / batch_size
 
-# 확률적 샘플링
+# ---------------------------
+# 확률적 샘플링 (물리현상 반영)
+# ---------------------------
 def probabilistic_sampling(model, input_data, num_samples=1000):
+    """
+    모델의 출력 확률에 대해, 아래에서 불어 올리는 공기의 영향(물리 bias)을 
+    각 공 번호의 선택 확률에 반영하여 샘플링합니다.
+    """
     model.eval()
     with torch.no_grad():
         logits = model(input_data)
-        probs = torch.softmax(logits, dim=-1)
-        
+        probs = torch.softmax(logits, dim=-1)  # shape: (batch, 6, 45)
+    
     samples = []
     for _ in range(num_samples):
         sample = set()
         while len(sample) < 6:
             pos = len(sample)
-            idx = torch.multinomial(probs[0,pos], 1).item()
-            num = idx + 1
+            # 기본 확률에 물리 bias를 곱하여 보정합니다.
+            adjusted_probs = probs[0, pos] * physical_bias_tensor
+            adjusted_probs = adjusted_probs / adjusted_probs.sum()
+            idx = torch.multinomial(adjusted_probs, 1).item()
+            num = idx + 1  # 0-base -> 1-base
             if num not in sample:
                 sample.add(num)
         samples.append(sorted(sample))
@@ -743,45 +769,46 @@ def probabilistic_sampling(model, input_data, num_samples=1000):
     return most_common_combinations(filtered if filtered else samples)
 
 def validate_combination(nums):
-    even = sum(1 for n in nums if n%2 == 0)
-    if not 2 <= even <=4:
+    # 예시 조건: 짝수 개수 2~4, 각 구간(1~10, 11~20, ...)의 최대 개수 제한
+    even = sum(1 for n in nums if n % 2 == 0)
+    if not 2 <= even <= 4:
         return False
     sections = [
-        sum(1 for n in nums if 1<=n<=10),
-        sum(1 for n in nums if 11<=n<=20),
-        sum(1 for n in nums if 21<=n<=30),
-        sum(1 for n in nums if 31<=n<=40),
-        sum(1 for n in nums if 41<=n<=45)
+        sum(1 for n in nums if 1 <= n <= 10),
+        sum(1 for n in nums if 11 <= n <= 20),
+        sum(1 for n in nums if 21 <= n <= 30),
+        sum(1 for n in nums if 31 <= n <= 40),
+        sum(1 for n in nums if 41 <= n <= 45)
     ]
     return max(sections) <= 3
-
 def most_common_combinations(samples, top=10):
     cnt = Counter(tuple(sorted(x)) for x in samples)
     return [list(item[0]) for item in cnt.most_common(top)]
 
+# ---------------------------
 # 평가 함수
+# ---------------------------
 def evaluate_model(model, dataloader):
     model.eval()
-    hit_counts = {n:0 for n in range(1,7)}
-    
+    hit_counts = {n: 0 for n in range(1, 7)}
     with torch.no_grad():
         for inputs, targets in dataloader:
-            targets = targets.cpu().numpy() + 1
+            targets_np = targets.cpu().numpy() + 1
             preds = probabilistic_sampling(model, inputs)
-            
-            for pred, target in zip(preds, targets):
+            for pred, target in zip(preds, targets_np):
                 target_set = set(target)
                 matches = len(target_set & set(pred))
                 if matches in hit_counts:
-                    hit_counts[matches] +=1
-                    
+                    hit_counts[matches] += 1
     total = len(dataloader.dataset)
     print("Evaluation Results:")
     for k in sorted(hit_counts.keys()):
-        print(f"{k} matches: {hit_counts[k]/total:.2%}")
+        print(f"{k} matches: {hit_counts[k] / total:.2%}")
     return hit_counts
 
+# ---------------------------
 # 학습 함수
+# ---------------------------
 def train_model(model, dataloader, criterion, optimizer):
     model.train()
     total_loss = 0.0
@@ -795,57 +822,69 @@ def train_model(model, dataloader, criterion, optimizer):
     avg_loss = total_loss / len(dataloader)
     print(f"Train Loss: {avg_loss:.4f}")
 
-# 데이터 분할
+
+# ---------------------------
+# DataLoader 준비
+# ---------------------------
 full_dataset = EnhancedDataset(lotto_data, window_size)
-full_dataset.set_training(True)  # 훈련 모드 설정
+full_dataset.set_training(True)
 tscv = TimeSeriesSplit(n_splits=5)
 splits = list(tscv.split(full_dataset))
 train_indices, val_indices = splits[-1]
-
 train_dataset = Subset(full_dataset, train_indices)
 val_dataset = Subset(full_dataset, val_indices)
-
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-# 모델 초기화
-model = HybridModel().to(device)
+# ---------------------------
+# 모델, 손실함수, 옵티마이저 초기화
+# ---------------------------
+model = HybridModel(input_size=59).to(device)
 criterion = PermutationInvariantLoss()
 optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
 
+# ---------------------------
+# 예측 입력 생성 함수 (물리정보 포함)
+# ---------------------------
+def create_prediction_input(data, window_size, physical_features, physical_scale):
+    recent_draws = data[-window_size:]
+    features = []
+    for nums in recent_draws:
+        vec = np.zeros(52 + 7, dtype=np.float32)
+        vec[np.array(nums)] = 1
+        actual_nums = [n+1 for n in nums]
+        even_ratio = sum(1 for n in actual_nums if n % 2 == 0) / 6
+        vec[45] = even_ratio
+        sections = [
+            sum(1 for n in actual_nums if 1 <= n <= 10) / 6,
+            sum(1 for n in actual_nums if 11 <= n <= 20) / 6,
+            sum(1 for n in actual_nums if 21 <= n <= 30) / 6,
+            sum(1 for n in actual_nums if 31 <= n <= 40) / 6,
+            sum(1 for n in actual_nums if n >= 41) / 6
+        ]
+        vec[46:51] = sections
+        sum_norm = sum(actual_nums) / 300.0
+        vec[51] = sum_norm
+        vec[52:] = physical_features / physical_scale
+        features.append(vec)
+    return torch.FloatTensor(np.array(features)).unsqueeze(0).to(device)
+
+# ---------------------------
 # 메인 실행
+# ---------------------------
 if __name__ == "__main__":
-    # 학습 루프
     for epoch in range(num_epochs):
         print(f"Epoch {epoch+1}/{num_epochs}")
         train_model(model, train_loader, criterion, optimizer)
         evaluate_model(model, val_loader)
-        print("-"*50)
+        print("-" * 50)
     
-    # 최종 예측
-    def create_prediction_input(data, window_size):
-        recent_draws = data[-window_size:]
-        features = []
-        for nums in recent_draws:
-            vec = np.zeros(45+7, dtype=np.float32)
-            vec[np.array(nums)] = 1
-            actual_nums = [n+1 for n in nums]
-            even_ratio = sum(1 for n in actual_nums if n%2==0)/6
-            sections = [
-                sum(1 for n in actual_nums if 1<=n<=10)/6,
-                sum(1 for n in actual_nums if 11<=n<=20)/6,
-                sum(1 for n in actual_nums if 21<=n<=30)/6,
-                sum(1 for n in actual_nums if 31<=n<=40)/6,
-                sum(1 for n in actual_nums if n>=41)/6
-            ]
-            sum_norm = sum(actual_nums) / 300.0
-            vec[45] = even_ratio
-            vec[46:51] = sections
-            vec[51] = sum_norm
-            features.append(vec)
-        return torch.FloatTensor(np.array(features)).unsqueeze(0).to(device)
-    
-    input_tensor = create_prediction_input(lotto_data, window_size)
+    # 최종 예측: 최신 로또 번호 이력과 물리정보를 사용하여 예측
+    input_tensor = create_prediction_input(
+        lotto_data, window_size,
+        physical_features=np.array([80, 80, 220, 200, 50, 4, 44.5], dtype=np.float32),
+        physical_scale=np.array([100, 100, 250, 250, 100, 5, 50], dtype=np.float32)
+    )
     predictions = probabilistic_sampling(model, input_tensor)
     
     print("\nTop 10 Recommended Combinations:")
